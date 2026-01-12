@@ -1,0 +1,52 @@
+﻿name: YouTube Movies Scraper
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1"   # lundi 07:00 UTC
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          MAX_MOVIES_PER_RUN: "5"
+        run: |
+          python main.py
+
+      - name: Debug - list generated files
+        run: |
+          ls -la
+          find . -maxdepth 2 -type f \( -name "*.csv" -o -name "*.json" \)
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add -f comments.csv state.json to_check_trailer.csv 2>/dev/null || true
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+
+          git commit -m "Weekly update: generated data"
+          git push
