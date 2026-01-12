@@ -4,8 +4,6 @@ import pandas as pd
 from datetime import datetime, timedelta
 from googleapiclient.discovery import build
 
-
-
 API_KEY = os.getenv("YOUTUBE_API_KEY")
 MAX_MOVIES_PER_RUN = int(os.getenv("MAX_MOVIES_PER_RUN", "5"))
 
@@ -14,33 +12,47 @@ STATE_FILE = "state.json"
 COMMENTS_FILE = "comments.csv"
 TRAILER_NOT_FOUND_FILE = "to_check_trailer.csv"
 
-TRAILER_LIFETIME_DAYS = 365 
+TRAILER_LIFETIME_DAYS = 365  # 1 an
 
 youtube = build("youtube", "v3", developerKey=API_KEY)
-
 
 
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"movies": {}}
+            state = json.load(f)
+            # compat si ancien state.json
+            if "movies" not in state:
+                state["movies"] = {}
+            if "next_index" not in state:
+                state["next_index"] = 0
+            return state
+    return {"movies": {}, "next_index": 0}
+
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
-def movie_key(title, year, release):
-    return f"{title.lower()}__{year}__{release}"
 
-def classify_period(date):
-    year = int(date[:4])
+def movie_key(title, year, release):
+    return f"{str(title).strip().lower()}__{year}__{release}"
+
+
+def classify_period(date_str):
+    year = int(date_str[:4])
     if year in (2020, 2021):
         return "covid"
     if year >= 2022:
         return "post_covid"
     return None
 
+
+def ensure_trailer_not_found_file():
+    # crée le fichier vide si absent (avec colonnes)
+    if not os.path.exists(TRAILER_NOT_FOUND_FILE):
+        df = pd.DataFrame(columns=["TITRE Français", "ANNEE", "DATE DE SORTIE FR", "last_checked"])
+        df.to_csv(TRAILER_NOT_FOUND_FILE, index=False)
 
 
 def search_trailer(title):
@@ -62,6 +74,7 @@ def search_trailer(title):
         "published_at": video["snippet"]["publishedAt"]
     }
 
+
 def get_comments(video_id, since=None):
     comments = []
     req = youtube.commentThreads().list(
@@ -77,6 +90,7 @@ def get_comments(video_id, since=None):
             s = item["snippet"]["topLevelComment"]["snippet"]
             published = s["publishedAt"]
 
+            # since = dernière date sauvegardée → on ne reprend pas les anciens
             if since and published <= since:
                 continue
 
@@ -86,8 +100,8 @@ def get_comments(video_id, since=None):
 
             comments.append({
                 "video_id": video_id,
-                "author": s["authorDisplayName"],
-                "text": s["textDisplay"],
+                "author": s.get("authorDisplayName", ""),
+                "text": s.get("textDisplay", ""),
                 "published_at": published,
                 "period": period
             })
@@ -97,22 +111,37 @@ def get_comments(video_id, since=None):
     return comments
 
 
-
 def main():
+    if not API_KEY:
+        raise RuntimeError("YOUTUBE_API_KEY manquant. Ajoute-le dans GitHub Secrets ou dans ton env local.")
+
     movies = pd.read_csv(MOVIES_FILE)
+    movies = movies.reset_index(drop=True)
+
     state = load_state()
+    ensure_trailer_not_found_file()
+
+    trailer_not_found_df = pd.read_csv(TRAILER_NOT_FOUND_FILE)
+
     processed = 0
     new_comments = []
     still_to_check = []
 
-    if os.path.exists(TRAILER_NOT_FOUND_FILE):
-        trailer_not_found_df = pd.read_csv(TRAILER_NOT_FOUND_FILE)
-    else:
-        trailer_not_found_df = pd.DataFrame()
+    total = len(movies)
+    start_index = int(state.get("next_index", 0))
 
-    for _, m in movies.iterrows():
-        if processed >= MAX_MOVIES_PER_RUN:
-            break
+    # Si on arrive à la fin, on recommence au début
+    if start_index >= total:
+        start_index = 0
+
+    i = start_index
+
+    # on boucle en "cercle" pour trouver MAX_MOVIES_PER_RUN films traitables
+    # sans rester bloqué si certains sont "finished"
+    visited = 0
+    while processed < MAX_MOVIES_PER_RUN and visited < total:
+        m = movies.iloc[i]
+        visited += 1
 
         title = m["TITRE Français"]
         year = m["ANNEE"]
@@ -121,8 +150,12 @@ def main():
 
         movie_state = state["movies"].get(key, {})
 
-       
+        # ✅ si déjà terminé → skip
+        if movie_state.get("finished") is True:
+            i = (i + 1) % total
+            continue
 
+        # ✅ si pas encore de trailer → on cherche
         if "video_id" not in movie_state:
             trailer = search_trailer(title)
 
@@ -131,8 +164,11 @@ def main():
                     "TITRE Français": title,
                     "ANNEE": year,
                     "DATE DE SORTIE FR": release,
-                    "last_checked": datetime.now().strftime("%Y-%m-%d")
+                    "last_checked": datetime.utcnow().strftime("%Y-%m-%d")
                 })
+                # même si trailer absent, on considère ce film comme "traité" dans le batch
+                processed += 1
+                i = (i + 1) % total
                 continue
 
             movie_state["video_id"] = trailer["video_id"]
@@ -140,19 +176,18 @@ def main():
             movie_state["last_comment_date"] = None
             movie_state["finished"] = False
 
-      
-
+        # ✅ règle 1 an : au-delà → finished
         trailer_date = datetime.fromisoformat(
             movie_state["trailer_published_at"].replace("Z", "")
         )
-
         if datetime.utcnow() - trailer_date > timedelta(days=TRAILER_LIFETIME_DAYS):
             movie_state["finished"] = True
             state["movies"][key] = movie_state
+            processed += 1
+            i = (i + 1) % total
             continue
 
-      
-
+        # ✅ récupère nouveaux commentaires
         comments = get_comments(
             movie_state["video_id"],
             movie_state.get("last_comment_date")
@@ -174,9 +209,12 @@ def main():
 
         state["movies"][key] = movie_state
         processed += 1
+        i = (i + 1) % total
 
-  
+    # ✅ on mémorise où reprendre la prochaine fois
+    state["next_index"] = i
 
+    # ✅ écrit les nouveaux commentaires
     if new_comments:
         pd.DataFrame(new_comments).to_csv(
             COMMENTS_FILE,
@@ -185,9 +223,11 @@ def main():
             header=not os.path.exists(COMMENTS_FILE)
         )
 
+    # ✅ met à jour to_check_trailer.csv (trailer non trouvé)
     if still_to_check:
         df_new = pd.DataFrame(still_to_check)
         df_all = pd.concat([trailer_not_found_df, df_new], ignore_index=True)
+
         df_all.drop_duplicates(
             subset=["TITRE Français", "ANNEE", "DATE DE SORTIE FR"],
             inplace=True
@@ -196,7 +236,8 @@ def main():
         df_all.to_csv(TRAILER_NOT_FOUND_FILE, index=False)
 
     save_state(state)
-    print("✅ Done")
+    print(f"✅ Done | processed={processed} | next_index={state['next_index']}")
+
 
 if __name__ == "__main__":
     main()
