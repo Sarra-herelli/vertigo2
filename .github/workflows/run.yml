@@ -1,4 +1,59 @@
-﻿      - name: Commit & push results
+﻿name: YouTube Movies Scraper
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1" # lundi 07:00 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youtube-scraper
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          MAX_MOVIES_PER_RUN: "5"
+        run: |
+          python main.py
+
+      - name: Debug - list generated files
+        run: |
+          echo "== FILES =="
+          ls -la
+          echo "== CSV/JSON found =="
+          find . -maxdepth 2 -type f \( -name "*.csv" -o -name "*.json" \) || true
+          echo "== PREVIEW comments.csv (if exists) =="
+          test -f comments.csv && head -n 3 comments.csv || echo "comments.csv not found"
+          echo "== PREVIEW state.json (if exists) =="
+          test -f state.json && head -n 20 state.json || echo "state.json not found"
+          echo "== PREVIEW to_check_trailer.csv (if exists) =="
+          test -f to_check_trailer.csv && head -n 3 to_check_trailer.csv || echo "to_check_trailer.csv not found"
+
+      - name: Commit & push results
         run: |
           set -eux
 
@@ -8,9 +63,10 @@
           echo "== BEFORE ADD =="
           git status
 
-          # Add generated files
-          git add comments.csv state.json || true
-          git add to_check_trailer.csv || true
+          # Add generated files (force in case gitignore ignores csv/json)
+          test -f comments.csv && git add -f comments.csv || true
+          test -f state.json && git add -f state.json || true
+          test -f to_check_trailer.csv && git add -f to_check_trailer.csv || true
 
           echo "== AFTER ADD =="
           git status
